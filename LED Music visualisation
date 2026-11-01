@@ -1,0 +1,525 @@
+%% ========================================================================
+% LED MUSIC VISUALIZATION - OFFLINE MODE (JTAG cable J17 only, no UART)
+%
+% 1. MATLAB analyses the song and builds one LED frame every 30 ms
+% frame = [band1 band2 band3 band4 band5 band6 beat]
+% 2. It writes the frames to led_data.h (compiled into the SDK app)
+% 3. The board app plays the frames in time; MATLAB plays the song
+%
+% Same DSP, same bands, same smoothing as the live version.
+% ========================================================================
+clear; clc; close all;
+fprintf('\n============================================================\n');
+fprintf(' ZEDBOARD MUSIC VISUALIZER - OFFLINE MODE (J17 only)\n');
+fprintf('============================================================\n\n');
+%% ========================================================================
+% 0. SETTINGS
+% ========================================================================
+FRAME_MS = 30; % LED update period on the board (keep = LED_FRAME_MS in C)
+SYNC_OFFSET = 0.10; % seconds; + = LEDs later, - = LEDs earlier
+MAX_SECONDS = 240; % only the first 240 s of the song are used
+USE_YAMNET = true; % true: try YAMNet genre (needs Audio Toolbox)
+% Folder of your SDK app (led_data.h is written here). If it does not
+% exist, the file is written to the current MATLAB folder instead.
+SDK_SRC = 'C:\Users\malav\Downloads\exp\zedboard_music\zedboard_music.sdk\music_led\src';
+%% ========================================================================
+% 1. AUDIO INPUT
+% ========================================================================
+fprintf('--- [1] AUDIO INPUT -----------------------------------------\n');
+[fileName, filePath] = uigetfile( ...
+ {'*.wav;*.mp3;*.m4a;*.flac','Audio Files'}, 'Select Music File');
+if isequal(fileName, 0)
+ error('No audio file selected.');
+end
+[audioRaw, FsOriginal] = audioread(fullfile(filePath, fileName));
+maxSamp = round(MAX_SECONDS * FsOriginal);
+if size(audioRaw,1) > maxSamp
+ audioRaw = audioRaw(1:maxSamp, :);
+ fprintf('Trimmed to first %d s of the song\n', MAX_SECONDS);
+end
+fprintf('File : %s\n', fileName);
+fprintf('Original Fs : %d Hz\n', FsOriginal);
+fprintf('Channels : %d\n', size(audioRaw,2));
+fprintf('Samples : %d\n', size(audioRaw,1));
+%% 2. STEREO TO MONO
+if size(audioRaw,2) > 1
+ audioMonoRaw = mean(audioRaw, 2);
+ fprintf('Stereo -> Mono : YES\n');
+else
+ audioMonoRaw = audioRaw;
+ fprintf('Stereo -> Mono : Already mono\n');
+end
+%% 3. NORMALIZATION
+peakBefore = max(abs(audioMonoRaw));
+audioMonoRaw = audioMonoRaw ./ (peakBefore + eps);
+fprintf('Peak before : %.4f\n', peakBefore);
+fprintf('Peak after : %.4f\n', max(abs(audioMonoRaw)));
+%% 4. RESAMPLING
+TargetFs = 22050;
+if FsOriginal > TargetFs
+ audioMono = safeResample(audioMonoRaw, TargetFs, FsOriginal);
+ Fs = TargetFs;
+ fprintf('Resampling : %d -> %d Hz\n', FsOriginal, Fs);
+else
+ audioMono = audioMonoRaw;
+ Fs = FsOriginal;
+ fprintf('Resampling : Not required\n');
+end
+audioMono = audioMono(:);
+numSamples = length(audioMono);
+duration = numSamples / Fs;
+fprintf('Working Fs : %d Hz\n', Fs);
+fprintf('Duration : %.2f sec\n', duration);
+%% ========================================================================
+% 5. BANDPASS FILTER
+% ========================================================================
+fprintf('\n--- [2] BANDPASS FILTER ------------------------------------\n');
+nyquist = Fs/2;
+lowCut = 20;
+highCut = min(10000, 0.95*nyquist);
+Wn = [lowCut highCut] / nyquist;
+try
+ [z, p, k] = butter(4, Wn, 'bandpass');
+ [sos, g] = zp2sos(z, p, k);
+ audioFiltered = filtfilt(sos, g, audioMono);
+ if any(~isfinite(audioFiltered))
+ error('Filter produced non-finite values.');
+ end
+ fprintf('Filter: 4th order Butterworth (SOS, zero-phase)\n');
+catch
+ firOrder = 200;
+ n = (-firOrder/2:firOrder/2);
+ n(n == 0) = eps;
+ b = (sin(Wn(2)*pi*n) ./ (pi*n)) - (sin(Wn(1)*pi*n) ./ (pi*n));
+ L = length(b);
+ hw = 0.54 - 0.46*cos(2*pi*(0:L-1)/(L-1));
+ b = b .* hw;
+ audioFiltered = conv(audioMono, b(:), 'same');
+ fprintf('Filter: FIR windowed sinc (no toolbox)\n');
+end
+fprintf('Passband : %.0f - %.0f Hz\n', lowCut, highCut);
+%% ========================================================================
+% 6. STFT PARAMETERS
+% ========================================================================
+fprintf('\n--- [3] STFT -----------------------------------------------\n');
+frameLen = round(0.04*Fs);
+hopLen = round(frameLen/2);
+winFunc = 0.5*(1 - cos(2*pi*(0:frameLen-1)'/frameLen)); % periodic Hann
+nfftFrame = 2^nextpow2(frameLen);
+halfNfft = floor(nfftFrame/2) + 1;
+freqBinsFrame = (0:halfNfft-1) * (Fs/nfftFrame);
+fprintf('Frame length : %d samples\n', frameLen);
+fprintf('Hop length : %d samples\n', hopLen);
+fprintf('FFT size : %d\n', nfftFrame);
+%% ========================================================================
+% 7. SIX LED FREQUENCY BANDS
+% ========================================================================
+bandDefsHz = [ 20 250
+ 250 500
+ 500 2000
+ 2000 4000
+ 4000 8000
+ 8000 nyquist ];
+if nyquist < 9000 % low-sample-rate file: keep bands 5 and 6 non-empty
+ bandDefsHz(5,:) = [4000 0.75*nyquist];
+ bandDefsHz(6,:) = [0.75*nyquist nyquist];
+end
+bandNames = {'Sub-bass';'Low-mid';'Mid';'Upper-mid';'High';'Very High'};
+numBands = 6;
+fprintf('\nFrequency bands:\n');
+for i = 1:numBands
+ fprintf('%d. %-12s %5.0f - %5.0f Hz\n', i, bandNames{i}, ...
+ bandDefsHz(i,1), bandDefsHz(i,2));
+end
+%% ========================================================================
+% 8. STFT FEATURE EXTRACTION
+% ========================================================================
+fprintf('\n--- [4] DSP FEATURE EXTRACTION ------------------------------\n');
+numFrames = floor((numSamples - frameLen)/hopLen) + 1;
+if numFrames < 3
+ error('Audio file is too short.');
+end
+rmsEnergy = zeros(numFrames,1);
+zcr = zeros(numFrames,1);
+spectralCentroid = zeros(numFrames,1);
+spectralRolloff = zeros(numFrames,1);
+spectralFlux = zeros(numFrames,1);
+% Frame CENTER times in seconds (same clock as audio playback)
+frameTimes = ((0:numFrames-1)'*hopLen + frameLen/2) / Fs;
+bandEnergyMatrix = zeros(numFrames, numBands);
+avgMagSpectrum = zeros(halfNfft,1);
+prevMag = zeros(halfNfft,1);
+bandBinMask = false(numBands, halfNfft);
+for bIdx = 1:numBands
+ bandBinMask(bIdx,:) = freqBinsFrame >= bandDefsHz(bIdx,1) & ...
+ freqBinsFrame < bandDefsHz(bIdx,2);
+end
+bandBinMask(numBands,:) = freqBinsFrame >= bandDefsHz(numBands,1);
+fprintf('Total STFT frames: %d\n', numFrames);
+progressStep = max(1, round(numFrames/10));
+for k = 1:numFrames
+ idxStart = (k-1)*hopLen + 1;
+ idxEnd = idxStart + frameLen - 1;
+ frame = audioFiltered(idxStart:idxEnd);
+ rmsEnergy(k) = sqrt(mean(frame.^2) + eps);
+ zcr(k) = sum(abs(diff(sign(frame)))) / (2*frameLen);
+ magK = abs(fft(frame .* winFunc, nfftFrame));
+ magK = magK(1:halfNfft);
+ magNorm = magK / (sum(magK) + eps);
+ spectralCentroid(k) = sum(freqBinsFrame(:) .* magNorm(:));
+ cumE = cumsum(magNorm);
+ rIdx = find(cumE >= 0.85, 1, 'first');
+ if isempty(rIdx), rIdx = halfNfft; end
+ spectralRolloff(k) = freqBinsFrame(rIdx);
+ % Spectral flux on log-compressed magnitude (more reliable onsets)
+ magL = log1p(100*magK);
+ if k > 1
+ df = magL - prevMag;
+ df(df < 0) = 0;
+ spectralFlux(k) = sum(df);
+ end
+ prevMag = magL;
+ for bIdx = 1:numBands
+ bandEnergyMatrix(k,bIdx) = sum(magK(bandBinMask(bIdx,:)).^2);
+ end
+ avgMagSpectrum = avgMagSpectrum + magK;
+ if mod(k, progressStep) == 0 || k == numFrames
+ fprintf('Frame %5d/%d %.1f%%\n', k, numFrames, 100*k/numFrames);
+ end
+end
+avgMagSpectrum = avgMagSpectrum / numFrames;
+% LED levels (0..1): dB scale, per-band normalization.
+% The floor (globalMaxDb - 60) stops a near-silent band from being
+% stretched up to full brightness.
+bandDb = 10*log10(bandEnergyMatrix + 1e-12);
+ledLevels = zeros(numFrames, numBands);
+dynRangeDb = 40;
+globalMaxDb = max(bandDb(:));
+for bIdx = 1:numBands
+ sortedDb = sort(bandDb(:,bIdx));
+ hi = sortedDb(max(1, round(0.98*numFrames)));
+ hi = max(hi, globalMaxDb - 60);
+ lo = hi - dynRangeDb;
+ ledLevels(:,bIdx) = min(1, max(0, (bandDb(:,bIdx) - lo) / (hi - lo)));
+end
+%% ========================================================================
+% 9. TEMPO ESTIMATION
+% ========================================================================
+fprintf('\n--- [5] TEMPO ESTIMATION -----------------------------------\n');
+frameRateHz = Fs / hopLen;
+onsetStrength = spectralFlux - min(spectralFlux);
+if max(onsetStrength) > 0
+ onsetStrength = onsetStrength / max(onsetStrength);
+end
+onsetSmoothed = movmean(onsetStrength, 3);
+xo = onsetSmoothed - mean(onsetSmoothed);
+to = (0:numFrames-1)' / frameRateHz;
+bpmGrid = 60:0.5:200;
+tempoScore = zeros(size(bpmGrid));
+for m = 1:numel(bpmGrid)
+ f = bpmGrid(m)/60;
+ s1 = abs(sum(xo .* exp(-1j*2*pi*f*to)));
+ s2 = abs(sum(xo .* exp(-1j*2*pi*2*f*to)));
+ tempoScore(m) = s1 + 0.5*s2;
+end
+prior = exp(-0.5*(log2(bpmGrid/120)/0.8).^2);
+tempoScore = tempoScore .* prior;
+[~, bi] = max(tempoScore);
+estimatedBPM = bpmGrid(bi);
+fprintf('Estimated BPM : %.1f\n', estimatedBPM);
+%% ========================================================================
+% 10. BEAT DETECTION
+% ========================================================================
+localMean = movmean(onsetSmoothed, max(3, round(1.0*frameRateHz)));
+thresh = localMean + 0.3*std(onsetSmoothed);
+minPeakDistFrames = max(1, round(0.2*frameRateHz));
+peakLocs = [];
+for i = 2:length(onsetSmoothed)-1
+ if onsetSmoothed(i) > onsetSmoothed(i-1) && ...
+ onsetSmoothed(i) >= onsetSmoothed(i+1) && ...
+ onsetSmoothed(i) >= thresh(i)
+ if isempty(peakLocs) || (i - peakLocs(end)) >= minPeakDistFrames
+ peakLocs(end+1) = i; %#ok<AGROW>
+ end
+ end
+end
+beatTimes = frameTimes(peakLocs);
+onsetRate = numel(beatTimes) / duration;
+fprintf('Beats detected : %d (%.2f /s)\n', numel(beatTimes), onsetRate);
+%% ========================================================================
+% 11. MOOD + GENRE CLASSIFICATION
+% ========================================================================
+fprintf('\n--- [6] MUSIC CLASSIFICATION -------------------------------\n');
+clamp01 = @(v) min(1, max(0, v));
+avgRMS = mean(rmsEnergy);
+avgZCR = mean(zcr);
+avgCentroid = mean(spectralCentroid);
+avgRolloff = mean(spectralRolloff);
+rmsDb = 20*log10(rmsEnergy + eps);
+avgRmsDb = mean(rmsDb);
+dynStd = std(rmsDb(rmsDb > -60));
+if isnan(dynStd), dynStd = 0; end
+magAvgOK = freqBinsFrame(:) >= 20;
+bassMask = freqBinsFrame(:) >= 20 & freqBinsFrame(:) < 250;
+bassRatio = sum(avgMagSpectrum(bassMask)) / (sum(avgMagSpectrum(magAvgOK)) + eps);
+[keyMode, keyName, modeScore] = estimateKeyMode(audioMono, Fs);
+fprintf('RMS : %.4f (%.1f dB)\n', avgRMS, avgRmsDb);
+fprintf('ZCR : %.4f\n', avgZCR);
+fprintf('Centroid : %.1f Hz\n', avgCentroid);
+fprintf('Rolloff : %.1f Hz\n', avgRolloff);
+fprintf('Bass ratio : %.2f\n', bassRatio);
+fprintf('Loudness variation: %.1f dB\n', dynStd);
+fprintf('Key / mode : %s %s (score %+.2f)\n', keyName, keyMode, modeScore);
+% ---- MOOD: arousal (energy) x valence (positivity) ----
+tempoN = clamp01((estimatedBPM - 60) / 120);
+loudN = clamp01((avgRmsDb + 30) / 20);
+brightN = clamp01((avgCentroid - 800) / 2700);
+onsetN = clamp01(onsetRate / 4);
+majorN = 0.5 + 0.5*max(-1, min(1, modeScore/0.25));
+arousal = 0.35*tempoN + 0.30*loudN + 0.20*brightN + 0.15*onsetN;
+valence = 0.50*majorN + 0.25*brightN + 0.25*tempoN;
+if arousal >= 0.5 && valence >= 0.5
+ aiEmotion = 'Happy / Energetic';
+elseif arousal >= 0.5
+ aiEmotion = 'Intense / Aggressive';
+elseif valence >= 0.5
+ aiEmotion = 'Calm / Relaxed';
+else
+ aiEmotion = 'Sad / Melancholic';
+end
+fprintf('Arousal / Valence : %.2f / %.2f\n', arousal, valence);
+fprintf('Detected mood : %s\n', aiEmotion);
+% ---- GENRE (heuristic): Gaussian match to reference profiles ----
+% bpm sigma bass sigma centroid sigma zcr sigma dyn sigma
+genreNames = {'EDM / Electronic','Rock / Metal','Hip-Hop / Rap', ...
+ 'Pop','Classical / Acoustic','Jazz / Lounge'};
+G = [ 128 12 0.65 0.15 2200 900 0.08 0.05 3.0 2.0
+ 135 25 0.50 0.15 3000 1000 0.12 0.05 4.0 2.0
+ 90 15 0.70 0.15 1800 700 0.07 0.04 3.5 2.0
+ 115 15 0.50 0.15 2200 800 0.09 0.04 3.5 2.0
+ 90 35 0.40 0.20 1500 700 0.05 0.03 7.0 3.0
+ 110 35 0.45 0.15 1800 700 0.07 0.04 5.0 2.5 ];
+feat = [estimatedBPM, bassRatio, avgCentroid, avgZCR, dynStd];
+genreScore = zeros(size(G,1),1);
+for gi = 1:size(G,1)
+ zf = (feat - G(gi,1:2:9)) ./ G(gi,2:2:10);
+ genreScore(gi) = mean(exp(-0.5*zf.^2));
+end
+[~, gBest] = max(genreScore);
+genreHeuristic = genreNames{gBest};
+% ---- GENRE (optional, more accurate): YAMNet via Audio Toolbox ----
+genreLabel = genreHeuristic;
+genreSource = 'heuristic';
+if USE_YAMNET
+ try
+ seg = audioMono;
+ if numSamples > 60*Fs
+ mid = round(numSamples/2);
+ seg = audioMono(mid-30*Fs : mid+30*Fs-1);
+ end
+ sounds = classifySound(seg, Fs);
+ if iscell(sounds), sounds = cellfun(@(c) string(c(1)), sounds); end
+ sounds = string(sounds(:));
+ genreList = ["Pop music","Hip hop music","Rock music","Heavy metal", ...
+ "Electronic music","Techno","House music","Electronic dance music", ...
+ "Classical music","Opera","Jazz","Blues","Country","Reggae", ...
+ "Soul music","Funk","Disco","Folk music","Music of Bollywood", ...
+ "Rhythm and blues","Dubstep","Drum and bass","Trance music", ...
+ "Ambient music","Punk rock","Progressive rock"];
+ sounds = sounds(ismember(sounds, genreList));
+ if ~isempty(sounds)
+ genreLabel = char(mode(categorical(sounds)));
+ genreSource = 'YAMNet';
+ end
+ catch
+ % Audio Toolbox / YAMNet model not available -> keep heuristic
+ end
+end
+[~, ord] = sort(genreScore, 'descend');
+fprintf('Genre (heuristic) : %s (top3: %s %.2f, %s %.2f, %s %.2f)\n', ...
+ genreHeuristic, genreNames{ord(1)}, genreScore(ord(1)), ...
+ genreNames{ord(2)}, genreScore(ord(2)), ...
+ genreNames{ord(3)}, genreScore(ord(3)));
+fprintf('Final genre : %s [%s]\n', genreLabel, genreSource);
+%% ========================================================================
+% 12. BUILD THE LED FRAME TABLE (what the board will play)
+% ========================================================================
+fprintf('\n--- [7] BUILD LED FRAMES -----------------------------------\n');
+stepSec = FRAME_MS / 1000;
+numOut = floor((duration + max(0, SYNC_OFFSET)) / stepSec) + 1;
+frames = zeros(numOut, 7, 'uint8'); % [b1 b2 b3 b4 b5 b6 beat]
+smoothLevels = zeros(1, numBands);
+decay = 0.80; % LED fall-off per update
+beatHoldSec = 0.08; % beat flag duration
+for n = 1:numOut
+ tAudio = (n-1)*stepSec - SYNC_OFFSET; % audio time shown by this frame
+ if tAudio < 0
+ smoothLevels(:) = 0; % before the song starts: dark
+ continue;
+ end
+ fIdx = min(numFrames, max(1, round((tAudio - frameTimes(1))*frameRateHz) + 1));
+ raw = ledLevels(fIdx,:);
+ smoothLevels = max(raw, smoothLevels*decay);
+ dtBeat = tAudio - beatTimes;
+ isBeat = any(dtBeat >= -0.02 & dtBeat <= beatHoldSec);
+ frames(n,1:6) = uint8(round(min(1, max(0, smoothLevels))*255));
+ frames(n,7) = uint8(isBeat);
+end
+fprintf('LED frames : %d (%d ms each, %.1f s)\n', numOut, FRAME_MS, numOut*stepSec);
+if isfolder(SDK_SRC)
+ outDir = SDK_SRC;
+else
+ outDir = pwd;
+ fprintf('SDK folder not found, writing to current folder instead.\n');
+end
+hdrPath = fullfile(outDir, 'led_data.h');
+fid = fopen(hdrPath, 'w');
+if fid < 0
+ error('Cannot write %s', hdrPath);
+end
+fprintf(fid, '/* generated by led_music_offline.m - song: %s */\n', fileName);
+fprintf(fid, '#define LED_FRAME_MS %d\n', FRAME_MS);
+fprintf(fid, '#define LED_NUM_FRAMES %d\n', numOut);
+fprintf(fid, 'static const unsigned char led_frames[LED_NUM_FRAMES][7] = {\n');
+fprintf(fid, '{%d,%d,%d,%d,%d,%d,%d},\n', frames.');
+fprintf(fid, '};\n');
+fclose(fid);
+fprintf('Written : %s\n', hdrPath);
+%% ========================================================================
+% 13. GUI (shows what the board LEDs are showing)
+% ========================================================================
+fprintf('\n--- [8] MATLAB GUI -----------------------------------------\n');
+guiFig = figure('Name','ZedBoard Music Visualizer (offline)','NumberTitle','off', ...
+ 'Position',[100 100 1100 700],'Color',[0.1 0.1 0.1]);
+ax1 = subplot(2,2,1,'Parent',guiFig);
+stepPlot = max(1, floor(numSamples/20000));
+tPlot = (0:stepPlot:numSamples-1)/Fs;
+plot(ax1, tPlot, audioFiltered(1:stepPlot:end));
+title(ax1,'Filtered Audio Waveform','Color','w');
+xlabel(ax1,'Time (s)','Color','w');
+ylabel(ax1,'Amplitude','Color','w');
+set(ax1,'XColor','w','YColor','w','Color',[0.15 0.15 0.15]);
+ax2 = subplot(2,2,2,'Parent',guiFig);
+plot(ax2, freqBinsFrame, avgMagSpectrum);
+title(ax2,'Average Frequency Spectrum','Color','w');
+xlabel(ax2,'Frequency (Hz)','Color','w');
+ylabel(ax2,'Magnitude','Color','w');
+set(ax2,'XColor','w','YColor','w','Color',[0.15 0.15 0.15]);
+ax3 = subplot(2,2,[3 4],'Parent',guiFig);
+ledBars = bar(ax3, 1:numBands, zeros(1,numBands));
+ylim(ax3,[0 1]);
+set(ax3,'XTick',1:numBands,'XTickLabel',bandNames, ...
+ 'XColor','w','YColor','w','Color',[0.15 0.15 0.15]);
+title(ax3, sprintf('%s | %s | %.1f BPM | %s %s', ...
+ upper(aiEmotion), genreLabel, estimatedBPM, keyName, keyMode), ...
+ 'Color','w');
+drawnow;
+%% ========================================================================
+% 14. SYNCHRONISED START
+% ========================================================================
+fprintf('\n============================================================\n');
+fprintf(' NOW ON THE BOARD (SDK):\n');
+fprintf(' 1. Right-click project music_led > Refresh (F5)\n');
+fprintf(' 2. Project > Clean..., then Build All (no errors)\n');
+fprintf(' 3. Run As > Launch on Hardware (System Debugger)\n');
+fprintf(' 4. The LEDs flash once per second (8 flashes). On the 9th\n');
+fprintf(' flash the LEDs start dancing: press ENTER here at that flash.\n');
+fprintf('============================================================\n');
+input('Press ENTER here on the 9th flash to start the music... ', 's');
+player = audioplayer(audioMonoRaw, FsOriginal);
+playerCleanup = onCleanup(@() safeStopPlayer(player)); %#ok<NASGU>
+play(player);
+fprintf('Playing... (close the figure to stop)\n');
+while isplaying(player) && ishandle(guiFig)
+ tPlay = get(player,'CurrentSample') / FsOriginal;
+ nIdx = min(numOut, max(1, floor(tPlay/stepSec) + 1));
+ set(ledBars, 'YData', double(frames(nIdx,1:6))/255);
+ if frames(nIdx,7) ~= 0
+ set(ledBars,'FaceColor',[1 1 1]);
+ else
+ set(ledBars,'FaceColor',[0 0.7 1]);
+ end
+ drawnow limitrate;
+ pause(0.03);
+end
+%% ========================================================================
+% END
+% ========================================================================
+fprintf('\n============================================================\n');
+fprintf(' FINISHED\n');
+fprintf('============================================================\n');
+fprintf('BPM : %.1f\n', estimatedBPM);
+fprintf('Music mood : %s\n', aiEmotion);
+fprintf('Genre : %s\n', genreLabel);
+fprintf('Key : %s %s\n', keyName, keyMode);
+fprintf('============================================================\n');
+%% ========================================================================
+% LOCAL FUNCTIONS
+% ========================================================================
+function safeStopPlayer(p)
+ try
+ if isvalid(p) && isplaying(p)
+ stop(p);
+ end
+ catch
+ end
+end
+function y = safeResample(x, targetFs, origFs)
+ try
+ y = resample(x, targetFs, origFs);
+ catch
+ ratio = origFs / targetFs;
+ w = max(1, round(ratio));
+ xs = movmean(x, w);
+ tOld = (0:length(x)-1)' / origFs;
+ tNew = (0:1/targetFs:tOld(end))';
+ y = interp1(tOld, xs, tNew, 'linear');
+ end
+end
+function r = pearson(a, b)
+ a = a(:) - mean(a(:));
+ b = b(:) - mean(b(:));
+ r = sum(a.*b) / (sqrt(sum(a.^2)*sum(b.^2)) + eps);
+end
+function [modeStr, keyName, modeScore] = estimateKeyMode(x, Fs)
+% Krumhansl-Schmuckler key/mode estimate from a chroma vector
+ x = x(:);
+ if numel(x) > 60*Fs
+ mid = round(numel(x)/2);
+ x = x(mid-30*Fs : mid+30*Fs-1);
+ end
+ N = 8192; hop = 4096;
+ if numel(x) < N, x(end+1:N) = 0; end
+ w = 0.5*(1 - cos(2*pi*(0:N-1)'/N));
+ f = (0:N/2)' * (Fs/N);
+ valid = f >= 100 & f <= 5000;
+ pc = mod(round(12*log2(f(valid)/440)) + 9, 12) + 1; % 1 = C ... 12 = B
+ nF = floor((numel(x)-N)/hop) + 1;
+ chroma = zeros(12,1);
+ for k = 1:nF
+ seg = x((k-1)*hop+1 : (k-1)*hop+N) .* w;
+ m = abs(fft(seg));
+ m = m(1:N/2+1);
+ mv = m(valid);
+ for c = 1:12
+ chroma(c) = chroma(c) + sum(mv(pc == c));
+ end
+ end
+ chroma = chroma / (sum(chroma) + eps);
+ majP = [6.35 2.23 3.48 2.33 4.38 4.09 2.52 5.19 2.39 3.66 2.29 2.88]';
+ minP = [6.33 2.68 3.52 5.38 2.60 3.53 2.54 4.75 3.98 2.69 3.34 3.17]';
+ rMaj = zeros(12,1); rMin = zeros(12,1);
+ for s = 0:11
+ rMaj(s+1) = pearson(chroma, circshift(majP, s));
+ rMin(s+1) = pearson(chroma, circshift(minP, s));
+ end
+ [bMaj, iMaj] = max(rMaj);
+ [bMin, iMin] = max(rMin);
+ names = {'C','C#','D','D#','E','F','F#','G','G#','A','A#','B'};
+ if bMaj >= bMin
+ modeStr = 'major'; keyName = names{iMaj};
+ else
+ modeStr = 'minor'; keyName = names{iMin};
+ end
+ modeScore = bMaj - bMin;
+end
