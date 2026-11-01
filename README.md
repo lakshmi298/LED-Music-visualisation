@@ -26,4 +26,19 @@ LED Music Visualisation is a Digital Signal Processing (DSP)-based project that 
 - Xilinx Zynq-7000 SoC
 
 ## Developed By
-Lakshmi Geeth Krishnan
+Lakshmi Geeth Krishnan 
+
+## Project Screenshots
+
+### DSP Output 1
+![DSP Output 1](dsp1.jpeg)
+
+### DSP Output 2
+![DSP Output 2](dsp2.jpeg)
+
+### DSP Output 3
+![DSP Output 3](dsp3.jpeg)
+
+## Project Demonstration
+
+[Watch the demonstration video](dsp4.mp4)
